@@ -54,6 +54,11 @@ class NewsChecker;
 class QToolButton;
 class InstanceProxyModel;
 class LabeledToolButton;
+class LauncherBanner;
+class QButtonGroup;
+class QComboBox;
+class QHBoxLayout;
+class QStackedWidget;
 class QLabel;
 class MinecraftLauncher;
 class BaseProfilerFactory;
@@ -230,6 +235,18 @@ class MainWindow : public QMainWindow {
     void runModalTask(Task* task);
     void instanceFromInstanceTask(InstanceTask* task);
 
+    // launcher-style layout (sidebar, Play/Installations pages, bottom play bar)
+    void setupLauncherLayout();
+    void showLauncherPage(int page);
+    void updateLauncherHero();
+    void updateNewsCards();
+    void rebuildInstancePicker();
+    void syncInstancePicker();
+    void updatePlayButton();
+    void showBannerMenu(const QPoint& pos);
+    QString customBannerPath() const;
+    QString bannerImagePath() const;
+
    private:
     Ui::MainWindow* ui;
     // these are managed by Qt's memory management model!
@@ -244,6 +261,16 @@ class MainWindow : public QMainWindow {
     KonamiCode* secretEventFilter = nullptr;
 
     std::shared_ptr<Setting> instanceToolbarSetting = nullptr;
+
+    // launcher-style layout
+    QStackedWidget* m_pageStack = nullptr;
+    QButtonGroup* m_pageTabs = nullptr;
+    LauncherBanner* m_banner = nullptr;
+    QString m_bannerSource;
+    QHBoxLayout* m_newsCardsLayout = nullptr;
+    QComboBox* m_instancePicker = nullptr;
+    QToolButton* m_playButton = nullptr;
+    std::shared_ptr<Setting> m_launcherPageSetting = nullptr;
 
     unique_qobject_ptr<NewsChecker> m_newsChecker;
 

@@ -481,9 +481,11 @@ void InstanceView::paintEvent([[maybe_unused]] QPaintEvent* event)
         auto innerBounds = bounds;
         innerBounds.adjust(10, 10, -10, -10);
 
-        QColor background = QApplication::palette().color(QPalette::WindowText);
-        QColor foreground = QApplication::palette().color(QPalette::Base);
-        foreground.setAlpha(190);
+        // Use the theme's own surface/text colors instead of an inverted palette,
+        // so the overlay sits quietly on dark themes like Hearth Dark.
+        QColor background = QApplication::palette().color(QPalette::AlternateBase);
+        QColor foreground = QApplication::palette().color(QPalette::WindowText);
+        foreground.setAlpha(220);
         painter.setFont(font);
         auto fontMetrics = painter.fontMetrics();
         auto textRect = fontMetrics.boundingRect(innerBounds, Qt::AlignHCenter | Qt::TextWordWrap, emptyString);
