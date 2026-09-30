@@ -1832,7 +1832,20 @@ enum LauncherPage { PlayPage = 0, InstallationsPage = 1 };
 // Mirror a QAction onto a QPushButton (QPushButton allows left-aligned text in QSS, QToolButton doesn't).
 void bindButtonToAction(QPushButton* button, QAction* action)
 {
-    auto sync = [button, action] {
+    // QPushButton::setMenu() is deliberately not used: Qt lays out buttons that own a menu
+    // differently (padding is dropped), which knocks them out of line with the other
+    // left-aligned sidebar rows. Instead the menu is popped up by hand and a small chevron
+    // label marks buttons that open one. Themes can restyle it via QLabel#menuChevron.
+    auto* chevron = new QLabel(QString(QChar(0x25BE)), button);
+    chevron->setObjectName(QStringLiteral("menuChevron"));
+    chevron->setAttribute(Qt::WA_TransparentForMouseEvents);
+    chevron->setAlignment(Qt::AlignCenter);
+    auto* chevronLayout = new QHBoxLayout(button);
+    chevronLayout->setContentsMargins(0, 0, 10, 0);
+    chevronLayout->addStretch(1);
+    chevronLayout->addWidget(chevron, 0, Qt::AlignVCenter);
+
+    auto sync = [button, action, chevron] {
         button->setText(action->iconText());
         button->setIcon(action->icon());
         button->setToolTip(action->toolTip());
@@ -1840,14 +1853,17 @@ void bindButtonToAction(QPushButton* button, QAction* action)
         button->setVisible(action->isVisible());
         button->setCheckable(action->isCheckable());
         button->setChecked(action->isChecked());
-        if (action->menu() && button->menu() != action->menu())
-            button->setMenu(action->menu());
+        chevron->setVisible(action->menu() != nullptr);
     };
     sync();
     QObject::connect(action, &QAction::changed, button, sync);
     QObject::connect(button, &QPushButton::clicked, action, [button, action] {
-        if (!button->menu())
-            action->trigger();
+        if (QMenu* actionMenu = action->menu()) {
+            button->setChecked(action->isChecked());
+            actionMenu->popup(button->mapToGlobal(QPoint(0, button->height())));
+            return;
+        }
+        action->trigger();
     });
 }
 
