@@ -1125,6 +1125,8 @@ SET(LAUNCHER_SOURCES
     ui/widgets/JavaWizardWidget.h
     ui/widgets/LabeledToolButton.cpp
     ui/widgets/LabeledToolButton.h
+    ui/widgets/LauncherBanner.cpp
+    ui/widgets/LauncherBanner.h
     ui/widgets/LanguageSelectionWidget.cpp
     ui/widgets/LanguageSelectionWidget.h
     ui/widgets/LogView.cpp

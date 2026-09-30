@@ -55,6 +55,15 @@
 #include <QActionGroup>
 #include <QApplication>
 #include <QButtonGroup>
+#include <QComboBox>
+#include <QFile>
+#include <QFrame>
+#include <QImage>
+#include <QPushButton>
+#include <QSignalBlocker>
+#include <QStackedWidget>
+#include <QTextDocumentFragment>
+#include <QVBoxLayout>
 #include <QFileDialog>
 #include <QHBoxLayout>
 #include <QHeaderView>
@@ -111,6 +120,7 @@
 #include "ui/themes/ITheme.h"
 #include "ui/themes/ThemeManager.h"
 #include "ui/widgets/LabeledToolButton.h"
+#include "ui/widgets/LauncherBanner.h"
 
 #include "minecraft/PackProfile.h"
 #include "minecraft/VersionFile.h"
@@ -185,7 +195,6 @@ MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent), ui(new Ui::MainWi
 
         ui->instanceToolBar->setVisibilityState(QByteArray::fromBase64(instanceToolbarSetting->get().toString().toUtf8()));
 
-        ui->instanceToolBar->addContextMenuAction(ui->newsToolBar->toggleViewAction());
         ui->instanceToolBar->addContextMenuAction(ui->instanceToolBar->toggleViewAction());
         ui->instanceToolBar->addContextMenuAction(ui->actionToggleStatusBar);
         ui->instanceToolBar->addContextMenuAction(ui->actionLockToolbars);
@@ -246,7 +255,6 @@ MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent), ui(new Ui::MainWi
 
     // add the toolbar toggles to the view menu
     ui->viewMenu->addAction(ui->instanceToolBar->toggleViewAction());
-    ui->viewMenu->addAction(ui->newsToolBar->toggleViewAction());
 
     updateThemeMenu();
     updateMainToolBar();
@@ -286,6 +294,8 @@ MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent), ui(new Ui::MainWi
 
         connect(newsLabel, &QAbstractButton::clicked, this, &MainWindow::newsButtonClicked);
         connect(m_newsChecker.get(), &NewsChecker::newsLoaded, this, &MainWindow::updateNewsLabel);
+        connect(m_newsChecker.get(), &NewsChecker::newsLoaded, this, &MainWindow::updateNewsCards);
+        connect(m_newsChecker.get(), &NewsChecker::newsLoadingFailed, this, [this] { updateNewsCards(); });
         updateNewsLabel();
     }
 
@@ -331,7 +341,6 @@ MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent), ui(new Ui::MainWi
         view->setSourceOfGroupCollapseStatus(
             [](const QString& groupName) -> bool { return APPLICATION->instances()->isGroupCollapsed(groupName); });
         connect(view, &InstanceView::groupStateChanged, APPLICATION->instances(), &InstanceList::on_GroupStateChanged);
-        ui->horizontalLayout->addWidget(view);
     }
     // The cat background
     {
@@ -398,6 +407,9 @@ MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent), ui(new Ui::MainWi
     connect(APPLICATION->accounts(), &AccountList::defaultAccountChanged, [this] { defaultAccountChanged(); });
     connect(APPLICATION->accounts(), &AccountList::listChanged, [this] { defaultAccountChanged(); });
 
+    // Replace the classic toolbar layout with the launcher-style one
+    setupLauncherLayout();
+
     // Show initial account
     defaultAccountChanged();
 
@@ -408,6 +420,7 @@ MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent), ui(new Ui::MainWi
     {
         m_newsChecker->reloadNews();
         updateNewsLabel();
+        updateNewsCards();
     }
 
     if (APPLICATION->updaterEnabled()) {
@@ -604,6 +617,8 @@ void MainWindow::updateLaunchButton()
     if (m_selectedInstance)
         m_selectedInstance->populateLaunchMenu(launchMenu);
     ui->actionLaunchInstance->setMenu(launchMenu);
+    if (m_playButton)
+        m_playButton->setMenu(launchMenu);
 }
 
 void MainWindow::updateThemeMenu()
@@ -1684,6 +1699,10 @@ void MainWindow::instanceChanged(const QModelIndex& current, [[maybe_unused]] co
 
         connect(m_selectedInstance, &BaseInstance::runningStatusChanged, this, &MainWindow::refreshCurrentInstance);
         connect(m_selectedInstance, &BaseInstance::profilerChanged, this, &MainWindow::refreshCurrentInstance);
+
+        syncInstancePicker();
+        updatePlayButton();
+        updateLauncherHero();
     } else {
         APPLICATION->settings()->set("SelectedInstance", QString());
         selectionBad();
@@ -1717,6 +1736,8 @@ void MainWindow::selectionBad()
     updateLaunchButton();
     renameButton->setText(tr("Rename Instance"));
     updateInstanceToolIcon("grass");
+    updatePlayButton();
+    updateLauncherHero();
 
     // ...and then see if we can enable the previously selected instance
     setSelectedInstanceById(APPLICATION->settings()->get("SelectedInstance").toString());
@@ -1783,4 +1804,479 @@ void MainWindow::refreshCurrentInstance()
 {
     auto current = view->selectionModel()->currentIndex();
     instanceChanged(current, current);
+}
+
+// ---------------------------------------------------------------------------
+// Launcher-style layout
+//
+//  +-----------+------------------------------------------------+
+//  | account   |  PLAY   INSTALLATIONS                          |
+//  |-----------|------------------------------------------------|
+//  | Add inst. |                                                |
+//  | Folders   |   banner: latest screenshot / custom image     |
+//  | Settings  |   instance name + description                  |
+//  | Help      |------------------------------------------------|
+//  | Updates   |   latest news cards                            |
+//  |           |------------------------------------------------|
+//  | version   | [instance picker]   [ PLAY v ]   [account]     |
+//  +-----------+------------------------------------------------+
+//
+// The classic top/news toolbars are parked in a hidden widget so their
+// actions keep working; the instance toolbar moves onto the Installations
+// page next to the instance grid.
+// ---------------------------------------------------------------------------
+
+namespace {
+enum LauncherPage { PlayPage = 0, InstallationsPage = 1 };
+
+// Mirror a QAction onto a QPushButton (QPushButton allows left-aligned text in QSS, QToolButton doesn't).
+void bindButtonToAction(QPushButton* button, QAction* action)
+{
+    auto sync = [button, action] {
+        button->setText(action->iconText());
+        button->setIcon(action->icon());
+        button->setToolTip(action->toolTip());
+        button->setEnabled(action->isEnabled());
+        button->setVisible(action->isVisible());
+        button->setCheckable(action->isCheckable());
+        button->setChecked(action->isChecked());
+        if (action->menu() && button->menu() != action->menu())
+            button->setMenu(action->menu());
+    };
+    sync();
+    QObject::connect(action, &QAction::changed, button, sync);
+    QObject::connect(button, &QPushButton::clicked, action, [button, action] {
+        if (!button->menu())
+            action->trigger();
+    });
+}
+
+QPushButton* makeSidebarButton(QWidget* parent, QAction* action)
+{
+    auto* button = new QPushButton(parent);
+    button->setProperty("sidebarItem", true);
+    button->setFlat(true);
+    button->setFocusPolicy(Qt::NoFocus);
+    button->setIconSize(QSize(18, 18));
+    button->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Fixed);
+    bindButtonToAction(button, action);
+    return button;
+}
+}  // namespace
+
+void MainWindow::setupLauncherLayout()
+{
+    // --- park the classic toolbars -------------------------------------------------
+    // Reparenting (not just hiding) keeps restoreState() from putting them back.
+    auto* parking = new QWidget(this);
+    parking->setObjectName(QStringLiteral("parkedToolbars"));
+    parking->hide();
+    for (QToolBar* bar : { ui->mainToolBar, ui->newsToolBar }) {
+        removeToolBar(bar);
+        bar->setParent(parking);
+    }
+    removeToolBar(ui->instanceToolBar);
+
+    auto* rootLayout = ui->horizontalLayout;
+    rootLayout->setContentsMargins(0, 0, 0, 0);
+    rootLayout->setSpacing(0);
+
+    // --- sidebar ---------------------------------------------------------------------
+    auto* sidebar = new QFrame(ui->centralWidget);
+    sidebar->setObjectName(QStringLiteral("launcherSidebar"));
+    sidebar->setFixedWidth(232);
+    auto* sidebarLayout = new QVBoxLayout(sidebar);
+    sidebarLayout->setContentsMargins(12, 14, 12, 12);
+    sidebarLayout->setSpacing(2);
+
+    auto* accountButton = new QPushButton(sidebar);
+    accountButton->setObjectName(QStringLiteral("sidebarAccount"));
+    accountButton->setFocusPolicy(Qt::NoFocus);
+    accountButton->setIconSize(QSize(32, 32));
+    accountButton->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Fixed);
+    bindButtonToAction(accountButton, ui->actionAccountsButton);
+    sidebarLayout->addWidget(accountButton);
+
+    auto* line = new QFrame(sidebar);
+    line->setObjectName(QStringLiteral("sidebarLine"));
+    line->setFrameShape(QFrame::HLine);
+    line->setFixedHeight(1);
+    sidebarLayout->addSpacing(8);
+    sidebarLayout->addWidget(line);
+    sidebarLayout->addSpacing(8);
+
+    for (QAction* action : { ui->actionAddInstance, ui->actionFoldersButton, ui->actionSettings, ui->actionHelpButton,
+                             ui->actionCheckUpdate }) {
+        sidebarLayout->addWidget(makeSidebarButton(sidebar, action));
+    }
+    sidebarLayout->addStretch(1);
+    sidebarLayout->addWidget(makeSidebarButton(sidebar, ui->actionCAT));
+
+    auto* versionLabel = new QLabel(BuildConfig.LAUNCHER_DISPLAYNAME + " " + BuildConfig.printableVersionString(), sidebar);
+    versionLabel->setObjectName(QStringLiteral("sidebarVersion"));
+    versionLabel->setContentsMargins(8, 6, 8, 0);
+    sidebarLayout->addWidget(versionLabel);
+
+    rootLayout->addWidget(sidebar);
+
+    // --- content column ------------------------------------------------------------------
+    auto* content = new QWidget(ui->centralWidget);
+    content->setObjectName(QStringLiteral("launcherContent"));
+    auto* contentLayout = new QVBoxLayout(content);
+    contentLayout->setContentsMargins(0, 0, 0, 0);
+    contentLayout->setSpacing(0);
+
+    // header with page tabs
+    auto* header = new QFrame(content);
+    header->setObjectName(QStringLiteral("launcherHeader"));
+    auto* headerLayout = new QHBoxLayout(header);
+    headerLayout->setContentsMargins(20, 0, 20, 0);
+    headerLayout->setSpacing(4);
+    m_pageTabs = new QButtonGroup(this);
+    m_pageTabs->setExclusive(true);
+    const QStringList tabNames = { tr("PLAY"), tr("INSTALLATIONS") };
+    for (int i = 0; i < tabNames.size(); ++i) {
+        auto* tab = new QPushButton(tabNames[i], header);
+        tab->setProperty("launcherTab", true);
+        tab->setCheckable(true);
+        tab->setFlat(true);
+        tab->setFocusPolicy(Qt::NoFocus);
+        tab->setMinimumHeight(48);
+        m_pageTabs->addButton(tab, i);
+        headerLayout->addWidget(tab);
+    }
+    headerLayout->addStretch(1);
+    contentLayout->addWidget(header);
+
+    m_pageStack = new QStackedWidget(content);
+    m_pageStack->setObjectName(QStringLiteral("launcherPages"));
+
+    // Play page: banner + news
+    {
+        auto* playPage = new QWidget(m_pageStack);
+        playPage->setObjectName(QStringLiteral("playPage"));
+        auto* playLayout = new QVBoxLayout(playPage);
+        playLayout->setContentsMargins(0, 0, 0, 0);
+        playLayout->setSpacing(0);
+
+        m_banner = new LauncherBanner(playPage);
+        m_banner->setObjectName(QStringLiteral("launcherBanner"));
+        m_banner->setToolTip(tr("Right-click to change the banner image"));
+        m_banner->setContextMenuPolicy(Qt::CustomContextMenu);
+        connect(m_banner, &QWidget::customContextMenuRequested, this, &MainWindow::showBannerMenu);
+        playLayout->addWidget(m_banner, 1);
+
+        auto* newsSection = new QFrame(playPage);
+        newsSection->setObjectName(QStringLiteral("newsSection"));
+        auto* newsLayout = new QVBoxLayout(newsSection);
+        newsLayout->setContentsMargins(24, 14, 24, 16);
+        newsLayout->setSpacing(10);
+
+        auto* newsHeader = new QHBoxLayout();
+        auto* newsTitle = new QLabel(tr("Latest news"), newsSection);
+        newsTitle->setObjectName(QStringLiteral("sectionTitle"));
+        newsHeader->addWidget(newsTitle);
+        newsHeader->addStretch(1);
+        auto* allNews = new QPushButton(tr("View all"), newsSection);
+        allNews->setObjectName(QStringLiteral("viewAllNews"));
+        allNews->setFlat(true);
+        allNews->setFocusPolicy(Qt::NoFocus);
+        connect(allNews, &QPushButton::clicked, this, &MainWindow::on_actionMoreNews_triggered);
+        newsHeader->addWidget(allNews);
+        newsLayout->addLayout(newsHeader);
+
+        m_newsCardsLayout = new QHBoxLayout();
+        m_newsCardsLayout->setSpacing(12);
+        newsLayout->addLayout(m_newsCardsLayout);
+
+        playLayout->addWidget(newsSection, 0);
+        m_pageStack->addWidget(playPage);
+    }
+
+    // Installations page: the classic instance grid + instance toolbar
+    {
+        auto* installPage = new QWidget(m_pageStack);
+        installPage->setObjectName(QStringLiteral("installationsPage"));
+        auto* installLayout = new QHBoxLayout(installPage);
+        installLayout->setContentsMargins(0, 0, 0, 0);
+        installLayout->setSpacing(0);
+        view->setParent(installPage);
+        installLayout->addWidget(view, 1);
+        ui->instanceToolBar->setParent(installPage);
+        ui->instanceToolBar->setOrientation(Qt::Vertical);
+        installLayout->addWidget(ui->instanceToolBar, 0);
+        ui->instanceToolBar->show();
+        m_pageStack->addWidget(installPage);
+    }
+
+    contentLayout->addWidget(m_pageStack, 1);
+
+    // bottom play bar
+    {
+        auto* playBar = new QFrame(content);
+        playBar->setObjectName(QStringLiteral("playBar"));
+        auto* barLayout = new QHBoxLayout(playBar);
+        barLayout->setContentsMargins(24, 12, 24, 12);
+        barLayout->setSpacing(16);
+
+        m_instancePicker = new QComboBox(playBar);
+        m_instancePicker->setObjectName(QStringLiteral("instancePicker"));
+        m_instancePicker->setIconSize(QSize(24, 24));
+        m_instancePicker->setFixedWidth(270);
+        m_instancePicker->setMinimumHeight(40);
+        m_instancePicker->setSizeAdjustPolicy(QComboBox::AdjustToMinimumContentsLengthWithIcon);
+        connect(m_instancePicker, &QComboBox::activated, this,
+                [this](int index) { setSelectedInstanceById(m_instancePicker->itemData(index).toString()); });
+        barLayout->addWidget(m_instancePicker, 0, Qt::AlignVCenter);
+        barLayout->addStretch(1);
+
+        m_playButton = new QToolButton(playBar);
+        m_playButton->setObjectName(QStringLiteral("playButton"));
+        m_playButton->setText(tr("PLAY"));
+        m_playButton->setToolButtonStyle(Qt::ToolButtonTextOnly);
+        m_playButton->setPopupMode(QToolButton::MenuButtonPopup);
+        m_playButton->setMinimumSize(250, 56);
+        m_playButton->setSizePolicy(QSizePolicy::Fixed, QSizePolicy::Fixed);
+        QFont playFont = m_playButton->font();
+        playFont.setPointSizeF(qMax(13.0, playFont.pointSizeF() * 1.5));
+        playFont.setWeight(QFont::Bold);
+        m_playButton->setFont(playFont);
+        connect(m_playButton, &QToolButton::clicked, this, &MainWindow::on_actionLaunchInstance_triggered);
+        barLayout->addWidget(m_playButton, 0, Qt::AlignVCenter);
+        barLayout->addStretch(1);
+
+        auto* barAccount = new QPushButton(playBar);
+        barAccount->setObjectName(QStringLiteral("playBarAccount"));
+        barAccount->setFlat(true);
+        barAccount->setFocusPolicy(Qt::NoFocus);
+        barAccount->setIconSize(QSize(24, 24));
+        barAccount->setFixedWidth(270);
+        barAccount->setMinimumHeight(40);
+        bindButtonToAction(barAccount, ui->actionAccountsButton);
+        barLayout->addWidget(barAccount, 0, Qt::AlignVCenter);
+
+        contentLayout->addWidget(playBar);
+    }
+
+    rootLayout->addWidget(content, 1);
+
+    // keep the instance picker in step with the instance list
+    connect(proxymodel, &QAbstractItemModel::rowsInserted, this, &MainWindow::rebuildInstancePicker);
+    connect(proxymodel, &QAbstractItemModel::rowsRemoved, this, &MainWindow::rebuildInstancePicker);
+    connect(proxymodel, &QAbstractItemModel::modelReset, this, &MainWindow::rebuildInstancePicker);
+    connect(proxymodel, &QAbstractItemModel::layoutChanged, this, &MainWindow::rebuildInstancePicker);
+    connect(proxymodel, &QAbstractItemModel::dataChanged, this, &MainWindow::rebuildInstancePicker);
+    rebuildInstancePicker();
+
+    // pages
+    m_launcherPageSetting = APPLICATION->settings()->getOrRegisterSetting("LauncherLayoutPage", static_cast<int>(PlayPage));
+    connect(m_pageTabs, &QButtonGroup::idClicked, this, &MainWindow::showLauncherPage);
+    showLauncherPage(m_launcherPageSetting->get().toInt());
+
+    updateNewsCards();
+    updatePlayButton();
+    updateLauncherHero();
+}
+
+void MainWindow::showLauncherPage(int page)
+{
+    if (!m_pageStack)
+        return;
+    if (page < 0 || page >= m_pageStack->count())
+        page = PlayPage;
+    m_pageStack->setCurrentIndex(page);
+    if (auto* tab = m_pageTabs->button(page))
+        tab->setChecked(true);
+    if (m_launcherPageSetting)
+        m_launcherPageSetting->set(page);
+    if (page == InstallationsPage)
+        view->setFocus();
+}
+
+void MainWindow::rebuildInstancePicker()
+{
+    if (!m_instancePicker)
+        return;
+    const QSignalBlocker blocker(m_instancePicker);
+    m_instancePicker->clear();
+    for (int row = 0; row < proxymodel->rowCount(); ++row) {
+        const QModelIndex index = proxymodel->index(row, 0);
+        const QString id = index.data(InstanceList::InstanceIDRole).toString();
+        const QString iconKey = index.data(Qt::DecorationRole).toString();
+        m_instancePicker->addItem(APPLICATION->icons()->getIcon(iconKey), index.data(Qt::DisplayRole).toString(), id);
+    }
+    if (m_instancePicker->count() == 0)
+        m_instancePicker->setPlaceholderText(tr("No instances yet"));
+    syncInstancePicker();
+}
+
+void MainWindow::syncInstancePicker()
+{
+    if (!m_instancePicker)
+        return;
+    const QSignalBlocker blocker(m_instancePicker);
+    const int index = m_selectedInstance ? m_instancePicker->findData(m_selectedInstance->id()) : -1;
+    m_instancePicker->setCurrentIndex(index);
+}
+
+void MainWindow::updatePlayButton()
+{
+    if (!m_playButton)
+        return;
+    m_playButton->setMenu(ui->actionLaunchInstance->menu());
+    if (!m_selectedInstance) {
+        m_playButton->setText(tr("PLAY"));
+        m_playButton->setEnabled(false);
+        m_playButton->setToolTip(tr("Select an instance first"));
+        return;
+    }
+    if (m_selectedInstance->isRunning()) {
+        m_playButton->setText(tr("PLAYING"));
+        m_playButton->setEnabled(false);
+        m_playButton->setToolTip(tr("%1 is running").arg(m_selectedInstance->name()));
+        return;
+    }
+    m_playButton->setText(tr("PLAY"));
+    m_playButton->setEnabled(m_selectedInstance->canLaunch());
+    m_playButton->setToolTip(tr("Launch %1").arg(m_selectedInstance->name()));
+}
+
+QString MainWindow::customBannerPath() const
+{
+    return FS::PathCombine(APPLICATION->dataRoot(), "launcher-banner.png");
+}
+
+QString MainWindow::bannerImagePath() const
+{
+    const QString custom = customBannerPath();
+    if (QFileInfo::exists(custom))
+        return custom;
+    if (m_selectedInstance) {
+        QDir screenshots(FS::PathCombine(m_selectedInstance->gameRoot(), "screenshots"));
+        const QFileInfoList shots =
+            screenshots.entryInfoList({ "*.png", "*.jpg", "*.jpeg" }, QDir::Files | QDir::Readable, QDir::Time);
+        if (!shots.isEmpty())
+            return shots.first().absoluteFilePath();
+    }
+    return {};
+}
+
+void MainWindow::updateLauncherHero()
+{
+    if (!m_banner)
+        return;
+    if (m_selectedInstance) {
+        m_banner->setTitle(m_selectedInstance->name());
+        m_banner->setSubtitle(m_selectedInstance->getStatusbarDescription());
+    } else {
+        m_banner->setTitle(tr("No instance selected"));
+        m_banner->setSubtitle(tr("Create an instance or pick one below to start playing."));
+    }
+
+    const QString source = bannerImagePath();
+    if (source != m_bannerSource) {
+        m_bannerSource = source;
+        m_banner->setImage(source.isEmpty() ? QPixmap() : QPixmap(source));
+    }
+}
+
+void MainWindow::showBannerMenu(const QPoint& pos)
+{
+    QMenu menu(this);
+    QAction* chooseImage = menu.addAction(tr("Set banner image..."));
+    QAction* useScreenshots = menu.addAction(tr("Use latest instance screenshot"));
+    useScreenshots->setEnabled(QFileInfo::exists(customBannerPath()));
+    menu.addSeparator();
+    QAction* openScreenshots = menu.addAction(QIcon::fromTheme("screenshots"), tr("Open screenshots folder"));
+    openScreenshots->setEnabled(m_selectedInstance != nullptr);
+
+    QAction* chosen = menu.exec(m_banner->mapToGlobal(pos));
+    if (!chosen)
+        return;
+
+    if (chosen == chooseImage) {
+        const QString file = QFileDialog::getOpenFileName(this, tr("Choose banner image"), QString(),
+                                                          tr("Images (*.png *.jpg *.jpeg *.bmp *.webp)"));
+        if (file.isEmpty())
+            return;
+        QImage image(file);
+        if (image.isNull() || !image.save(customBannerPath(), "PNG")) {
+            QMessageBox::warning(this, tr("Banner image"), tr("Couldn't use that image."));
+            return;
+        }
+        m_bannerSource.clear();
+        updateLauncherHero();
+    } else if (chosen == useScreenshots) {
+        QFile::remove(customBannerPath());
+        m_bannerSource.clear();
+        updateLauncherHero();
+    } else if (chosen == openScreenshots && m_selectedInstance) {
+        DesktopServices::openPath(FS::PathCombine(m_selectedInstance->gameRoot(), "screenshots"), true);
+    }
+}
+
+void MainWindow::updateNewsCards()
+{
+    if (!m_newsCardsLayout)
+        return;
+
+    while (QLayoutItem* item = m_newsCardsLayout->takeAt(0)) {
+        if (QWidget* widget = item->widget())
+            widget->deleteLater();
+        delete item;
+    }
+
+    auto* host = m_newsCardsLayout->parentWidget();
+    auto addMessage = [this, host](const QString& text) {
+        auto* label = new QLabel(text, host);
+        label->setObjectName(QStringLiteral("newsEmpty"));
+        m_newsCardsLayout->addWidget(label, 1);
+    };
+
+    if (m_newsChecker->isLoadingNews()) {
+        addMessage(tr("Loading news..."));
+        return;
+    }
+    const QList<NewsEntryPtr> entries = m_newsChecker->getNewsEntries();
+    if (entries.isEmpty()) {
+        addMessage(tr("No news available."));
+        return;
+    }
+
+    const QString linkColor = palette().color(QPalette::WindowText).name();
+    const int count = qMin(3, static_cast<int>(entries.size()));
+    for (int i = 0; i < count; ++i) {
+        const NewsEntryPtr& entry = entries[i];
+
+        auto* card = new QFrame(host);
+        card->setObjectName(QStringLiteral("newsCard"));
+        card->setMinimumHeight(96);
+        auto* cardLayout = new QVBoxLayout(card);
+        cardLayout->setContentsMargins(14, 12, 14, 12);
+        cardLayout->setSpacing(6);
+
+        auto* title = new QLabel(card);
+        title->setObjectName(QStringLiteral("newsCardTitle"));
+        title->setWordWrap(true);
+        title->setTextFormat(Qt::RichText);
+        title->setText(QStringLiteral("<a href=\"news\" style=\"color:%1; text-decoration:none;\">%2</a>")
+                           .arg(linkColor, entry->title.toHtmlEscaped()));
+        connect(title, &QLabel::linkActivated, this, [this] { on_actionMoreNews_triggered(); });
+
+        QString summary = QTextDocumentFragment::fromHtml(entry->content).toPlainText().simplified();
+        if (summary.length() > 150)
+            summary = summary.left(147).trimmed() + QStringLiteral("...");
+        auto* body = new QLabel(summary, card);
+        body->setObjectName(QStringLiteral("newsCardBody"));
+        body->setTextFormat(Qt::PlainText);
+        body->setWordWrap(true);
+        body->setAlignment(Qt::AlignTop | Qt::AlignLeft);
+
+        cardLayout->addWidget(title);
+        cardLayout->addWidget(body, 1);
+        m_newsCardsLayout->addWidget(card, 1);
+    }
+    // keep card widths consistent when there are fewer than three posts
+    for (int i = count; i < 3; ++i)
+        m_newsCardsLayout->addStretch(1);
 }
